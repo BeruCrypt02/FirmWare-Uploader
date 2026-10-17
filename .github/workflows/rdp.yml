@@ -20,16 +20,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Setup XFCE4, XRDP & Chrome
+      - name: Fast Setup XFCE & XRDP
         env:
           U_NAME: ${{ github.event.inputs.username }}
           U_PASS: ${{ github.event.inputs.password }}
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 aria2 curl wget git file-roller
-
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xrdp aria2 curl wget git
 
           sudo useradd -m -s /bin/bash --force-badname "$U_NAME" || true
           echo "$U_NAME:$U_PASS" | sudo chpasswd
