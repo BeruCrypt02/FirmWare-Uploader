@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       ts_key:
-        description: 'Tailscale Auth Key (Leave empty if using Secret TS_KEY)'
-        required: false
+        description: 'Tailscale Auth Key'
+        required: true
       username:
         description: 'Linux Username'
         required: true
-        default: 'BeruCrypt02'
+        default: 'beru'
       password:
         description: 'Linux Password'
         required: true
@@ -20,37 +20,31 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Setup XFCE4, XRDP & RAM Boost
+      - name: Setup XFCE4, XRDP & Chrome
         env:
           U_NAME: ${{ github.event.inputs.username }}
           U_PASS: ${{ github.event.inputs.password }}
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 firefox zram-tools aria2 curl wget git thunar-archive-plugin file-roller
-          
-          echo -e "ALGO=lz4\nPERCENT=100" | sudo tee /etc/default/zramswap
-          sudo systemctl restart zramswap || true
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 aria2 curl wget git file-roller
 
-          sudo useradd -m -s /bin/bash "$U_NAME" || true
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+
+          sudo useradd -m -s /bin/bash --force-badname "$U_NAME" || true
           echo "$U_NAME:$U_PASS" | sudo chpasswd
           sudo usermod -aG sudo,adm,ssl-cert "$U_NAME"
-          echo "$U_NAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/"$U_NAME"
+          echo "$U_NAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/beru_user
 
           echo "xfce4-session" | sudo -u "$U_NAME" tee /home/"$U_NAME"/.xsession
-          sudo chown "$U_NAME:$U_NAME" /home/"$U_NAME"/.xsession
+          sudo sed -i 's|^test -x /etc/X11/Xsession && exec /etc/X11/Xsession|exec startxfce4|g' /etc/xrdp/startwm.sh
 
-          sudo sed -i 's/max_bpp=32/max_bpp=24/g' /etc/xrdp/xrdp.ini
-          sudo sed -i 's/xserverbpp=24/xserverbpp=16/g' /etc/xrdp/xrdp.ini
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
 
       - name: Connect Tailscale
         env:
-          TS_AUTH: ${{ github.event.inputs.ts_key != '' && github.event.inputs.ts_key || secrets.TS_KEY }}
+          TS_AUTH: ${{ github.event.inputs.ts_key }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey="$TS_AUTH" --hostname="beru-xfce" --accept-routes
@@ -62,20 +56,12 @@ jobs:
         run: |
           IP=$(tailscale ip -4)
           RAM=$(free -h | awk '/^Mem:/ {print $2}')
-          SWAP=$(free -h | awk '/^Swap:/ {print $2}')
           echo "========================================="
           echo "RDP IP       : $IP"
           echo "USERNAME     : $U_NAME"
           echo "PASSWORD     : $U_PASS"
-          echo "RAM / SWAP   : $RAM / $SWAP"
+          echo "RAM          : $RAM"
           echo "========================================="
-          {
-            echo "### Beru XFCE RDP Ready"
-            echo "- **IP:** \`$IP\`"
-            echo "- **Username:** \`$U_NAME\`"
-            echo "- **Password:** \`$U_PASS\`"
-            echo "- **Memory:** \`$RAM RAM + $SWAP Swap\`"
-          } >> $GITHUB_STEP_SUMMARY
 
       - name: Keep Alive (6 Hours)
         run: |
