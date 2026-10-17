@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xrdp aria2 curl wget git
 
-          sudo useradd -m -s /bin/bash --force-badname "$U_NAME" || true
+          sudo useradd -m -s /bin/bash --badname "$U_NAME" || true
           echo "$U_NAME:$U_PASS" | sudo chpasswd
           sudo usermod -aG sudo,adm,ssl-cert "$U_NAME"
           echo "$U_NAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/beru_user
