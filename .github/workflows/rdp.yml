@@ -3,6 +3,17 @@ name: Beru-Windows-RDP
 on:
   workflow_dispatch:
     inputs:
+      ts_key:
+        description: 'Tailscale Auth Key (reusable if auto-restart is on)'
+        required: true
+      username:
+        description: 'Windows Username'
+        required: true
+        default: 'beru'
+      password:
+        description: 'Windows Password (must meet complexity rules)'
+        required: true
+        default: 'Beru2026'
       auto_restart:
         description: 'Start a new runner before the 6h limit'
         required: true
@@ -31,8 +42,8 @@ jobs:
     steps:
       - name: Prepare user, RDP and Defender
         env:
-          U_NAME: ${{ secrets.RDP_USER }}
-          U_PASS: ${{ secrets.RDP_PASS }}
+          U_NAME: ${{ inputs.username }}
+          U_PASS: ${{ inputs.password }}
         run: |
           "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -103,9 +114,11 @@ jobs:
 
       - name: Install and connect Tailscale
         env:
-          TS_AUTH: ${{ secrets.TS_AUTHKEY }}
+          TS_AUTH: ${{ inputs.ts_key }}
           TS_HOST: beru-win-${{ github.run_number }}
         run: |
+          Write-Host "::add-mask::$env:TS_AUTH"
+
           $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
@@ -137,6 +150,9 @@ jobs:
           choco install -y --no-progress rclone aria2
 
       - name: Show RDP details
+        env:
+          U_NAME: ${{ inputs.username }}
+          U_PASS: ${{ inputs.password }}
         run: |
           $ram   = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
           $cpu   = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
@@ -147,8 +163,8 @@ jobs:
           Write-Host "  WINDOWS RDP READY"
           Write-Host "=========================================="
           Write-Host "  IP        : $env:TS_IP"
-          Write-Host "  Username  : (RDP_USER secret)"
-          Write-Host "  Password  : (RDP_PASS secret)"
+          Write-Host "  Username  : $env:U_NAME"
+          Write-Host "  Password  : $env:U_PASS"
           Write-Host "  RAM       : $ram GB"
           Write-Host "  CPU       : $cpu ($cores threads)"
           Write-Host "  Free disk : $disk GB (C:)"
@@ -159,6 +175,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           AUTO_RESTART: ${{ inputs.auto_restart }}
+          IN_TS_KEY: ${{ inputs.ts_key }}
+          IN_USER: ${{ inputs.username }}
+          IN_PASS: ${{ inputs.password }}
           IN_TOOLS: ${{ inputs.install_tools }}
           WORKFLOW_NAME: ${{ github.workflow }}
           REF_NAME: ${{ github.ref_name }}
@@ -174,6 +193,7 @@ jobs:
             if ($env:AUTO_RESTART -eq 'true' -and -not $restarted -and [DateTimeOffset]::UtcNow -ge $restartAt) {
               Write-Host "Starting the next runner..."
               gh workflow run "$env:WORKFLOW_NAME" --ref "$env:REF_NAME" `
+                -f ts_key="$env:IN_TS_KEY" -f username="$env:IN_USER" -f password="$env:IN_PASS" `
                 -f auto_restart=true -f install_tools="$env:IN_TOOLS"
               if ($LASTEXITCODE -eq 0) { Write-Host "Next runner dispatched." }
               else { Write-Host "Dispatch failed, check token permissions." }
