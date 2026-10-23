@@ -1,68 +1,179 @@
-name: Beru-XFCE-RDP
+name: Beru-Windows-RDP
 
 on:
   workflow_dispatch:
     inputs:
       ts_key:
-        description: 'Tailscale Auth Key'
+        description: 'Tailscale Auth Key (use a reusable key if auto-restart is on)'
         required: true
       username:
-        description: 'Linux Username'
+        description: 'Windows Username'
         required: true
         default: 'beru'
       password:
-        description: 'Linux Password'
+        description: 'Windows Password (must meet complexity rules)'
         required: true
         default: 'Beru2026'
+      auto_restart:
+        description: 'Start a new runner before the 6h limit'
+        required: true
+        type: boolean
+        default: true
+      install_tools:
+        description: 'Install rclone + aria2 for fast uploads'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
-  xfce-rdp:
-    runs-on: ubuntu-24.04
+  windows-rdp:
+    name: Windows RDP via Tailscale
+    runs-on: windows-2022
     timeout-minutes: 360
+
     steps:
-      - name: Fast Setup XFCE & XRDP
+      - name: Prepare user, RDP and performance tweaks
         env:
-          U_NAME: ${{ github.event.inputs.username }}
-          U_PASS: ${{ github.event.inputs.password }}
+          U_NAME: ${{ inputs.username }}
+          U_PASS: ${{ inputs.password }}
         run: |
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 aria2 curl wget git
+          # Remember when this job started (used by the keep-alive loop)
+          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          sudo useradd -m -s /bin/bash --badname "$U_NAME" || true
-          echo "$U_NAME:$U_PASS" | sudo chpasswd
-          sudo usermod -aG sudo,adm,ssl-cert "$U_NAME"
-          echo "$U_NAME ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/beru_user
+          # Create the user, or update the password if it already exists
+          $sec = ConvertTo-SecureString $env:U_PASS -AsPlainText -Force
+          if (Get-LocalUser -Name $env:U_NAME -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $env:U_NAME -Password $sec
+          } else {
+            New-LocalUser -Name $env:U_NAME -Password $sec `
+              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $env:U_NAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:U_NAME -ErrorAction SilentlyContinue
 
-          
-          echo "unset DBUS_SESSION_BUS_ADDRESS" | sudo tee -a /etc/xrdp/startwm.sh
-          echo "unset XDG_RUNTIME_DIR" | sudo tee -a /etc/xrdp/startwm.sh
-          echo ". /etc/profile" | sudo tee -a /etc/xrdp/startwm.sh
-          echo "exec startxfce4" | sudo tee -a /etc/xrdp/startwm.sh
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
+          # Speed: stop Defender from scanning big dump files
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 
-      - name: Connect Tailscale
+          # Never sleep
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          Write-Host "User '$env:U_NAME' ready, RDP enabled."
+
+      - name: Install and connect Tailscale
         env:
-          TS_AUTH: ${{ github.event.inputs.ts_key }}
+          TS_AUTH: ${{ inputs.ts_key }}
+          TS_HOST: beru-win-${{ github.run_number }}
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="$TS_AUTH" --hostname="beru-xfce" --accept-routes
+          Write-Host "::add-mask::$env:TS_AUTH"
 
-      - name: Show RDP Details
+          $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          & $ts up --authkey="$env:TS_AUTH" --hostname="$env:TS_HOST" --accept-routes --accept-dns=false --unattended
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale failed to connect" }
+
+          # Wait until an IP is assigned
+          $ip = $null
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 3 }
+          }
+          if (-not $ip) { throw "No Tailscale IP assigned" }
+
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale connected: $ip"
+
+      - name: Install upload tools (rclone, aria2)
+        if: ${{ inputs.install_tools == true }}
+        continue-on-error: true
+        run: |
+          # Git, 7-Zip, Python, GitHub CLI, Chrome and Android platform-tools
+          # are already included in the runner image.
+          choco install -y --no-progress rclone aria2
+
+      - name: Show RDP details
         env:
-          U_NAME: ${{ github.event.inputs.username }}
-          U_PASS: ${{ github.event.inputs.password }}
+          U_NAME: ${{ inputs.username }}
+          U_PASS: ${{ inputs.password }}
         run: |
-          IP=$(tailscale ip -4)
-          RAM=$(free -h | awk '/^Mem:/ {print $2}')
-          echo "========================================="
-          echo "RDP IP       : $IP"
-          echo "USERNAME     : $U_NAME"
-          echo "PASSWORD     : $U_PASS"
-          echo "RAM          : $RAM"
-          echo "========================================="
+          $ram  = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $cpu  = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          $disk = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          $rdp  = (Test-NetConnection -ComputerName localhost -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
 
-      - name: Keep Alive (6 Hours)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  WINDOWS RDP READY"
+          Write-Host "=========================================="
+          Write-Host "  IP        : $env:TS_IP"
+          Write-Host "  Username  : $env:U_NAME"
+          Write-Host "  Password  : $env:U_PASS"
+          Write-Host "  RAM       : $ram GB"
+          Write-Host "  CPU       : $cpu"
+          Write-Host "  Free disk : $disk GB (C:)"
+          Write-Host "  RDP 3389  : listening = $rdp"
+          Write-Host "=========================================="
+          Write-Host ""
+
+      - name: Keep alive and auto-restart
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUTO_RESTART: ${{ inputs.auto_restart }}
+          IN_TS_KEY: ${{ inputs.ts_key }}
+          IN_USER: ${{ inputs.username }}
+          IN_PASS: ${{ inputs.password }}
+          IN_TOOLS: ${{ inputs.install_tools }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          sleep 21000
+          $start       = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
+          $restartAt   = $start.AddMinutes(330)   # start the next runner
+          $endAt       = $start.AddMinutes(350)   # stop this runner
+          $restarted   = $false
+
+          while ([DateTimeOffset]::UtcNow -lt $endAt) {
+            if (Test-Path "C:\stop.txt") { Write-Host "Stop file found. Exiting."; break }
+
+            if ($env:AUTO_RESTART -eq 'true' -and -not $restarted -and [DateTimeOffset]::UtcNow -ge $restartAt) {
+              Write-Host "Starting the next runner..."
+              gh workflow run "$env:WORKFLOW_NAME" --ref "$env:REF_NAME" `
+                -f ts_key="$env:IN_TS_KEY" -f username="$env:IN_USER" -f password="$env:IN_PASS" `
+                -f auto_restart=true -f install_tools="$env:IN_TOOLS"
+              if ($LASTEXITCODE -eq 0) { Write-Host "Next runner dispatched." }
+              else { Write-Host "Dispatch failed, check token permissions." }
+              $restarted = $true
+            }
+
+            $left = [int]($endAt - [DateTimeOffset]::UtcNow).TotalMinutes
+            Write-Host "Remaining: $left min | IP: $env:TS_IP"
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Disconnect Tailscale
+        if: always()
+        run: |
+          & "C:\Program Files\Tailscale\tailscale.exe" logout 2>$null
