@@ -9,11 +9,11 @@ on:
       username:
         description: 'Windows Username'
         required: true
-        default: 'beru'
+        default: 'BeruCrypt002'
       password:
         description: 'Windows Password'
         required: true
-        default: 'Beru@2026!'
+        default: 'Beru12112k'
       auto_restart:
         description: 'Start a new runner before the 6h limit'
         required: true
@@ -46,29 +46,30 @@ jobs:
           U_PASS: ${{ inputs.password }}
           INSTALL_TOOLS: ${{ inputs.install_tools }}
         run: |
+          $ErrorActionPreference = 'SilentlyContinue'
           $ProgressPreference = 'SilentlyContinue'
           "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           if ($env:INSTALL_TOOLS -eq 'true') {
-            Start-Process choco -ArgumentList "install -y --no-progress --limit-output rclone aria2" -NoNewWindow
+            Start-Process choco -ArgumentList "install -y --no-progress --limit-output rclone aria2" -WindowStyle Hidden
           }
 
           secedit /export /cfg C:\secpol.cfg | Out-Null
           (Get-Content C:\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content C:\secpol.cfg
           secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
-          Remove-Item C:\secpol.cfg -Force -ErrorAction SilentlyContinue
+          Remove-Item C:\secpol.cfg -Force
 
           $sec = ConvertTo-SecureString $env:U_PASS -AsPlainText -Force
-          if (Get-LocalUser -Name $env:U_NAME -ErrorAction SilentlyContinue) {
+          if (Get-LocalUser -Name $env:U_NAME) {
             Set-LocalUser -Name $env:U_NAME -Password $sec
           } else {
             New-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
-          Add-LocalGroupMember -Group "Administrators" -Member $env:U_NAME -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:U_NAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:U_NAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:U_NAME
 
-          Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -SubmitSamplesConsent 2 -MAPSReporting 0 -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionPath "C:\", "D:\" -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -SubmitSamplesConsent 2 -MAPSReporting 0
+          Add-MpPreference -ExclusionPath "C:\", "D:\"
 
           fsutil behavior set disablelastaccess 1 | Out-Null
           fsutil behavior set disable8dot3 1 | Out-Null
@@ -78,28 +79,25 @@ jobs:
           powercfg /change monitor-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
 
-          $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
-          Set-ItemProperty -Path $mm -Name 'NetworkThrottlingIndex' -Value 0xffffffff -Type DWord -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path $mm -Name 'SystemResponsiveness' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xffffffff /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f | Out-Null
 
           netsh int tcp set global autotuninglevel=normal | Out-Null
           netsh int tcp set global rss=enabled | Out-Null
-          netsh int tcp set global dca=enabled | Out-Null
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name 'DWMFRAMEINTERVAL' -Value 15 -Type DWord
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f | Out-Null
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" /v DWMFRAMEINTERVAL /t REG_DWORD /d 15 /f | Out-Null
 
-          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item -Path $ts -Force | Out-Null
-          Set-ItemProperty -Path $ts -Name 'ColorDepth' -Value 4 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'fNoRemoteDesktopWallpaper' -Value 1 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'SelectTransport' -Value 0 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'bEnumerateHWBeforeSW' -Value 1 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'AVC444ModePreferred' -Value 1 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'AVCHardwareEncodePreferred' -Value 1 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'MaxCompressionLevel' -Value 1 -Type DWord
-          Set-ItemProperty -Path $ts -Name 'fDisableFontSmoothing' -Value 0 -Type DWord
+          $tsPol = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          reg add $tsPol /v ColorDepth /t REG_DWORD /d 4 /f | Out-Null
+          reg add $tsPol /v fNoRemoteDesktopWallpaper /t REG_DWORD /d 1 /f | Out-Null
+          reg add $tsPol /v SelectTransport /t REG_DWORD /d 0 /f | Out-Null
+          reg add $tsPol /v bEnumerateHWBeforeSW /t REG_DWORD /d 1 /f | Out-Null
+          reg add $tsPol /v AVC444ModePreferred /t REG_DWORD /d 1 /f | Out-Null
+          reg add $tsPol /v AVCHardwareEncodePreferred /t REG_DWORD /d 1 /f | Out-Null
+          reg add $tsPol /v MaxCompressionLevel /t REG_DWORD /d 1 /f | Out-Null
+          reg add $tsPol /v fDisableFontSmoothing /t REG_DWORD /d 0 /f | Out-Null
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-Service -Name TermService -StartupType Automatic
@@ -107,18 +105,17 @@ jobs:
 
           $svcs = 'WSearch','SysMain','wuauserv','DiagTrack','Spooler','WerSvc','UsoSvc','MapsBroker','PcaSvc'
           foreach ($svc in $svcs) {
-            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
-            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            Stop-Service -Name $svc -Force
+            Set-Service -Name $svc -StartupType Disabled
           }
 
           $procs = 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker','TrustedInstaller'
           foreach ($p in $procs) {
-            Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
+            Stop-Process -Name $p -Force
           }
 
-          $sm = 'HKLM:\SOFTWARE\Microsoft\ServerManager'
-          New-Item -Path $sm -Force | Out-Null
-          Set-ItemProperty -Path $sm -Name 'DoNotOpenServerManagerAtLogon' -Value 1 -Type DWord
+          reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Server\ServerManager" /v DoNotOpenAtLogon /t REG_DWORD /d 1 /f | Out-Null
 
           reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
           reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
@@ -126,7 +123,11 @@ jobs:
           reg add "HKU\DefUser\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
           reg add "HKU\DefUser\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
           reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+          [gc]::Collect()
+          Start-Sleep -Seconds 1
           reg unload HKU\DefUser | Out-Null
+
+          $global:LASTEXITCODE = 0
 
       - name: Connect Tailscale
         env:
@@ -229,4 +230,8 @@ jobs:
       - name: Cleanup Tailscale
         if: always()
         run: |
-          & "C:\Program Files\Tailscale\tailscale.exe" logout 2>$null
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout 2>$null
+          }
+          $global:LASTEXITCODE = 0
