@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       ts_key:
-        description: 'Tailscale Auth Key (reusable if auto-restart is on)'
+        description: 'Tailscale Auth Key'
         required: true
       username:
         description: 'Windows Username'
         required: true
         default: 'beru'
       password:
-        description: 'Windows Password (must meet complexity rules)'
+        description: 'Windows Password'
         required: true
-        default: 'Beru2026'
+        default: 'Beru@2026!'
       auto_restart:
         description: 'Start a new runner before the 6h limit'
         required: true
@@ -40,116 +40,120 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Prepare user, RDP and Defender
+      - name: Boost System, RDP 60FPS and Network
         env:
           U_NAME: ${{ inputs.username }}
           U_PASS: ${{ inputs.password }}
+          INSTALL_TOOLS: ${{ inputs.install_tools }}
         run: |
-          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
-            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $ProgressPreference = 'SilentlyContinue'
+          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # Create the user, or update the password if it already exists
+          if ($env:INSTALL_TOOLS -eq 'true') {
+            Start-Process choco -ArgumentList "install -y --no-progress --limit-output rclone aria2" -NoNewWindow
+          }
+
+          secedit /export /cfg C:\secpol.cfg | Out-Null
+          (Get-Content C:\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+          Remove-Item C:\secpol.cfg -Force -ErrorAction SilentlyContinue
+
           $sec = ConvertTo-SecureString $env:U_PASS -AsPlainText -Force
           if (Get-LocalUser -Name $env:U_NAME -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name $env:U_NAME -Password $sec
           } else {
-            New-LocalUser -Name $env:U_NAME -Password $sec `
-              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            New-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
           Add-LocalGroupMember -Group "Administrators" -Member $env:U_NAME -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:U_NAME -ErrorAction SilentlyContinue
 
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -SubmitSamplesConsent 2 -MAPSReporting 0 -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "C:\", "D:\" -ErrorAction SilentlyContinue
 
-          # Stop Defender from scanning big dump files
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+          fsutil behavior set disablelastaccess 1 | Out-Null
+          fsutil behavior set disable8dot3 1 | Out-Null
 
-          # Never sleep
+          powercfg /setactive SCHEME_MIN
           powercfg /change standby-timeout-ac 0
           powercfg /change monitor-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
 
-          Write-Host "User ready, RDP enabled."
+          $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+          Set-ItemProperty -Path $mm -Name 'NetworkThrottlingIndex' -Value 0xffffffff -Type DWord -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $mm -Name 'SystemResponsiveness' -Value 0 -Type DWord -ErrorAction SilentlyContinue
 
-      - name: Optimize for RDP performance
-        continue-on-error: true
-        run: |
-          # High performance power plan
-          powercfg /setactive SCHEME_MIN
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled | Out-Null
+          netsh int tcp set global dca=enabled | Out-Null
 
-          # RDP policies: 16-bit color, no wallpaper, allow UDP + TCP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name 'DWMFRAMEINTERVAL' -Value 15 -Type DWord
+
           $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $ts -Force | Out-Null
-          Set-ItemProperty -Path $ts -Name 'ColorDepth' -Value 3 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'ColorDepth' -Value 4 -Type DWord
           Set-ItemProperty -Path $ts -Name 'fNoRemoteDesktopWallpaper' -Value 1 -Type DWord
           Set-ItemProperty -Path $ts -Name 'SelectTransport' -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'bEnumerateHWBeforeSW' -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'AVC444ModePreferred' -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'AVCHardwareEncodePreferred' -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'MaxCompressionLevel' -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name 'fDisableFontSmoothing' -Value 0 -Type DWord
 
-          # Stop heavy background services
-          foreach ($svc in 'WSearch','SysMain','wuauserv','DiagTrack') {
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+          $svcs = 'WSearch','SysMain','wuauserv','DiagTrack','Spooler','WerSvc','UsoSvc','MapsBroker','PcaSvc'
+          foreach ($svc in $svcs) {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
           }
 
-          # Do not open Server Manager at logon
+          $procs = 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker','TrustedInstaller'
+          foreach ($p in $procs) {
+            Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
+          }
+
           $sm = 'HKLM:\SOFTWARE\Microsoft\ServerManager'
           New-Item -Path $sm -Force | Out-Null
           Set-ItemProperty -Path $sm -Name 'DoNotOpenServerManagerAtLogon' -Value 1 -Type DWord
 
-          # Best-performance visual effects for every NEW profile (default user hive)
           reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
           reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
           reg add "HKU\DefUser\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
           reg add "HKU\DefUser\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
           reg add "HKU\DefUser\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
-          [gc]::Collect()
-          Start-Sleep -Seconds 2
+          reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
           reg unload HKU\DefUser | Out-Null
 
-          Write-Host "RDP performance tweaks applied."
-
-      - name: Install and connect Tailscale
+      - name: Connect Tailscale
         env:
           TS_AUTH: ${{ inputs.ts_key }}
           TS_HOST: beru-win-${{ github.run_number }}
         run: |
           Write-Host "::add-mask::$env:TS_AUTH"
-
           $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          curl.exe -sL "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -o $msi
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 5
 
-          & $ts up --authkey="$env:TS_AUTH" --hostname="$env:TS_HOST" --accept-routes --accept-dns=false --unattended
-          if ($LASTEXITCODE -ne 0) { throw "Tailscale failed to connect" }
+          & $ts up --authkey="$env:TS_AUTH" --hostname="$env:TS_HOST" --accept-routes --accept-dns=false --unattended --reset
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed" }
 
-          # Wait until an IP is assigned
           $ip = $null
-          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
             $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if (-not $ip) { Start-Sleep -Seconds 3 }
+            if (-not $ip) { Start-Sleep -Seconds 1 }
           }
           if (-not $ip) { throw "No Tailscale IP assigned" }
 
           "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Tailscale connected: $ip"
 
-      - name: Install upload tools (rclone, aria2)
-        if: ${{ inputs.install_tools == true }}
-        continue-on-error: true
-        run: |
-          # Git, 7-Zip, Python, GitHub CLI, Chrome and Android platform-tools
-          # are already included in the runner image.
-          choco install -y --no-progress rclone aria2
-
-      - name: Show RDP details
+      - name: Print RDP Details
         env:
           U_NAME: ${{ inputs.username }}
           U_PASS: ${{ inputs.password }}
@@ -159,8 +163,20 @@ jobs:
           $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
           $disk  = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
 
-          Write-Host "=========================================="
-          Write-Host "  WINDOWS RDP READY"
+          $summary = @(
+            "**Windows RDP Ready (60FPS Boosted)**"
+            ""
+            "| Property | Value |"
+            "| :--- | :--- |"
+            "| **IP** | ``$env:TS_IP`` |"
+            "| **Username** | ``$env:U_NAME`` |"
+            "| **Password** | ``$env:U_PASS`` |"
+            "| **CPU** | $cpu ($cores Threads) |"
+            "| **RAM** | $ram GB |"
+            "| **Free Disk** | $disk GB |"
+          ) -join "`n"
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
           Write-Host "=========================================="
           Write-Host "  IP        : $env:TS_IP"
           Write-Host "  Username  : $env:U_NAME"
@@ -170,7 +186,7 @@ jobs:
           Write-Host "  Free disk : $disk GB (C:)"
           Write-Host "=========================================="
 
-      - name: Keep alive and auto-restart
+      - name: Keep Alive and Auto-Restart
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -183,20 +199,25 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           $start     = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
-          $restartAt = $start.AddMinutes(330)   # dispatch the next runner
-          $endAt     = $start.AddMinutes(350)   # stop this runner
+          $restartAt = $start.AddMinutes(335)
+          $endAt     = $start.AddMinutes(355)
           $restarted = $false
 
           while ([DateTimeOffset]::UtcNow -lt $endAt) {
-            if (Test-Path "C:\stop.txt") { Write-Host "Stop file found. Exiting."; break }
+            if (Test-Path "C:\stop.txt") { break }
+
+            $procs = 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker'
+            foreach ($p in $procs) {
+              Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
+            }
 
             if ($env:AUTO_RESTART -eq 'true' -and -not $restarted -and [DateTimeOffset]::UtcNow -ge $restartAt) {
-              Write-Host "Starting the next runner..."
               gh workflow run "$env:WORKFLOW_NAME" --ref "$env:REF_NAME" `
-                -f ts_key="$env:IN_TS_KEY" -f username="$env:IN_USER" -f password="$env:IN_PASS" `
-                -f auto_restart=true -f install_tools="$env:IN_TOOLS"
-              if ($LASTEXITCODE -eq 0) { Write-Host "Next runner dispatched." }
-              else { Write-Host "Dispatch failed, check token permissions." }
+                -f ts_key="$env:IN_TS_KEY" `
+                -f username="$env:IN_USER" `
+                -f password="$env:IN_PASS" `
+                -f auto_restart="$env:AUTO_RESTART" `
+                -f install_tools="$env:IN_TOOLS"
               $restarted = $true
             }
 
@@ -205,7 +226,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: Disconnect Tailscale
+      - name: Cleanup Tailscale
         if: always()
         run: |
           & "C:\Program Files\Tailscale\tailscale.exe" logout 2>$null
