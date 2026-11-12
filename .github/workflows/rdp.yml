@@ -1,10 +1,11 @@
+
 name: Beru-Windows-RDP
 
 on:
   workflow_dispatch:
     inputs:
       ts_key:
-        description: 'Tailscale Auth Key'
+        description: 'Tailscale Auth Key (use a reusable / ephemeral key)'
         required: true
       username:
         description: 'Windows Username'
@@ -20,7 +21,7 @@ on:
         type: boolean
         default: true
       install_tools:
-        description: 'Install rclone + aria2 for fast uploads'
+        description: 'Install rclone + aria2 + 7zip + OpenSSH + WinRM'
         required: true
         type: boolean
         default: true
@@ -29,9 +30,17 @@ permissions:
   actions: write
   contents: read
 
+concurrency:
+  group: beru-windows-rdp
+  cancel-in-progress: false
+
 defaults:
   run:
     shell: pwsh
+
+env:
+  TS_HOST_NAME: beru-win-${{ github.run_number }}
+  BERU_DIR: C:\beru
 
 jobs:
   windows-rdp:
@@ -40,154 +49,478 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Boost System, RDP 60FPS and Network
+      - name: Preflight - account, security policy, Defender
         env:
           U_NAME: ${{ inputs.username }}
           U_PASS: ${{ inputs.password }}
-          INSTALL_TOOLS: ${{ inputs.install_tools }}
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
-          $ProgressPreference = 'SilentlyContinue'
-          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $ProgressPreference    = 'SilentlyContinue'
 
-          if ($env:INSTALL_TOOLS -eq 'true') {
-            Start-Process choco -ArgumentList "install -y --no-progress --limit-output rclone aria2" -WindowStyle Hidden
-          }
+          New-Item -ItemType Directory -Force -Path $env:BERU_DIR | Out-Null
+          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           secedit /export /cfg C:\secpol.cfg | Out-Null
-          (Get-Content C:\secpol.cfg).Replace("PasswordComplexity = 1", "PasswordComplexity = 0") | Set-Content C:\secpol.cfg
+          $cfg = [IO.File]::ReadAllText('C:\secpol.cfg')
+          $cfg = $cfg -replace 'PasswordComplexity\s*=\s*1',      'PasswordComplexity = 0'
+          $cfg = $cfg -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0'
+          $cfg = $cfg -replace 'PasswordHistorySize\s*=\s*\d+',   'PasswordHistorySize = 0'
+          $cfg = $cfg -replace 'MinimumPasswordAge\s*=\s*\d+',    'MinimumPasswordAge = 0'
+          $cfg = $cfg -replace 'MaximumPasswordAge\s*=\s*-?\d+',  'MaximumPasswordAge = -1'
+          $cfg = $cfg -replace 'LockoutBadCount\s*=\s*\d+',       'LockoutBadCount = 0'
+          [IO.File]::WriteAllText('C:\secpol.cfg', $cfg, [Text.Encoding]::Unicode)
           secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Warning "secedit returned $LASTEXITCODE" }
           Remove-Item C:\secpol.cfg -Force
 
           $sec = ConvertTo-SecureString $env:U_PASS -AsPlainText -Force
           if (Get-LocalUser -Name $env:U_NAME) {
-            Set-LocalUser -Name $env:U_NAME -Password $sec
+            Set-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires $true -AccountNeverExpires -UserMayChangePassword $false
           } else {
-            New-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            New-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires -AccountNeverExpires `
+              -UserMayChangePassword $false -Description 'Beru RDP' | Out-Null
           }
-          Add-LocalGroupMember -Group "Administrators" -Member $env:U_NAME
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:U_NAME
-
-          Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true -SubmitSamplesConsent 2 -MAPSReporting 0
-          Add-MpPreference -ExclusionPath "C:\", "D:\"
-
-          fsutil behavior set disablelastaccess 1 | Out-Null
-          fsutil behavior set disable8dot3 1 | Out-Null
-
-          powercfg /setactive SCHEME_MIN
-          powercfg /change standby-timeout-ac 0
-          powercfg /change monitor-timeout-ac 0
-          powercfg /change hibernate-timeout-ac 0
-
-          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /t REG_DWORD /d 0xffffffff /f | Out-Null
-          reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /t REG_DWORD /d 0 /f | Out-Null
-
-          netsh int tcp set global autotuninglevel=normal | Out-Null
-          netsh int tcp set global rss=enabled | Out-Null
-
-          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
-          reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 0 /f | Out-Null
-          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" /v DWMFRAMEINTERVAL /t REG_DWORD /d 15 /f | Out-Null
-
-          $tsPol = "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          reg add $tsPol /v ColorDepth /t REG_DWORD /d 4 /f | Out-Null
-          reg add $tsPol /v fNoRemoteDesktopWallpaper /t REG_DWORD /d 1 /f | Out-Null
-          reg add $tsPol /v SelectTransport /t REG_DWORD /d 0 /f | Out-Null
-          reg add $tsPol /v bEnumerateHWBeforeSW /t REG_DWORD /d 1 /f | Out-Null
-          reg add $tsPol /v AVC444ModePreferred /t REG_DWORD /d 1 /f | Out-Null
-          reg add $tsPol /v AVCHardwareEncodePreferred /t REG_DWORD /d 1 /f | Out-Null
-          reg add $tsPol /v MaxCompressionLevel /t REG_DWORD /d 1 /f | Out-Null
-          reg add $tsPol /v fDisableFontSmoothing /t REG_DWORD /d 0 /f | Out-Null
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-Service -Name TermService -StartupType Automatic
-          Restart-Service -Name TermService -Force
-
-          $svcs = 'WSearch','SysMain','wuauserv','DiagTrack','Spooler','WerSvc','UsoSvc','MapsBroker','PcaSvc'
-          foreach ($svc in $svcs) {
-            Stop-Service -Name $svc -Force
-            Set-Service -Name $svc -StartupType Disabled
+          foreach ($grp in 'Administrators','Remote Desktop Users') {
+            $names = @(Get-LocalGroupMember -Group $grp | Select-Object -ExpandProperty Name)
+            if (-not ($names -match "\\$([regex]::Escape($env:U_NAME))$")) {
+              Add-LocalGroupMember -Group $grp -Member $env:U_NAME
+            }
           }
 
-          $procs = 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker','TrustedInstaller'
-          foreach ($p in $procs) {
-            Stop-Process -Name $p -Force
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /v DisableAntiSpyware /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender" /v DisableAntiVirus /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" /v DisableBehaviorMonitoring /t REG_DWORD /d 1 /f | Out-Null
+          Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true `
+            -DisableScriptScanning $true -DisableBehaviorMonitoring $true -DisableBlockAtFirstSeen $true `
+            -SubmitSamplesConsent 2 -MAPSReporting 0
+          Add-MpPreference -ExclusionPath 'C:\'
+          & sc.exe config WinDefend start= disabled | Out-Null
+          & sc.exe stop WinDefend | Out-Null
+
+          $global:LASTEXITCODE = 0
+
+      - name: Install tools (rclone, aria2, 7zip, OpenSSH, WinRM)
+        if: ${{ inputs.install_tools }}
+        env:
+          INSTALL_TOOLS: ${{ inputs.install_tools }}
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          if ($env:INSTALL_TOOLS -ne 'true') { return }
+
+          & choco feature enable -n allowGlobalConfirmation | Out-Null
+          & choco install -y --no-progress --limit-output rclone aria2 7zip | Out-Null
+          'C:\ProgramData\chocolatey\bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell `
+            -Value 'C:\Program Files\PowerShell\7\pwsh.exe' -Type String -Force
+          & sc.exe config sshd start= auto | Out-Null
+          & sc.exe start sshd | Out-Null
+
+          Enable-PSRemoting -SkipNetworkProfileCheck -Force | Out-Null
+          Set-Item WSMan:\localhost\Client\TrustedHosts -Value '*' -Force | Out-Null
+          & sc.exe config WinRM start= auto | Out-Null
+
+          $env:Path = "$env:Path;C:\ProgramData\chocolatey\bin"
+          rclone version | Select-Object -First 1
+          aria2c --version | Select-Object -First 1
+          $global:LASTEXITCODE = 0
+
+      - name: Harden - services, Windows Update, telemetry
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          function Stop-Svc([string]$n) {
+            & sc.exe stop $n | Out-Null
+            $i = 0
+            while ($i -lt 12 -and (Get-Service -Name $n -ErrorAction SilentlyContinue).Status -eq 'Running') {
+              Start-Sleep -Milliseconds 500
+              $i++
+            }
+            & sc.exe config $n start= disabled | Out-Null
           }
+
+          $svcs = 'WSearch','SysMain','wuauserv','WaaSMedicSvc','DiagTrack','dmwappushservice',
+                  'WerSvc','Spooler','MapsBroker','PcaSvc','DoSvc','WpnService',
+                  'RemoteRegistry','RetailDemo','Fax','TapiSrv','PhoneSvc'
+          foreach ($s in $svcs) { Stop-Svc $s }
+
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v AUOptions /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" /v DisableWindowsUpdateAccess /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" /v AUOptions /t REG_DWORD /d 1 /f | Out-Null
+
+          Get-ScheduledTask | Where-Object {
+            $_.TaskPath -match 'Windows\\(UpdateOrchestrator|WindowsUpdate|WaaSMedic|InstallService)' -or
+            $_.TaskName -match '^(ProgramDataUpdater|Consolidator|UsbCeip|Schedule Scan|Proxy)$'
+          } | Disable-ScheduledTask | Out-Null
+
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f | Out-Null
 
           reg add "HKLM\SOFTWARE\Microsoft\ServerManager" /v DoNotOpenServerManagerAtLogon /t REG_DWORD /d 1 /f | Out-Null
           reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Server\ServerManager" /v DoNotOpenAtLogon /t REG_DWORD /d 1 /f | Out-Null
 
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f | Out-Null
+
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v DisableLockWorkstation /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v InactivityTimeoutSecs /t REG_DWORD /d 0 /f | Out-Null
+
+          $global:LASTEXITCODE = 0
+
+      - name: Performance - power, MMCSS, TCP latency, memory
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          powercfg /hibernate off
+          powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+          powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61
+          if ($LASTEXITCODE -ne 0) { powercfg /setactive SCHEME_MIN }
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+          Set-ItemProperty $mm -Name NetworkThrottlingIndex -Value 0xffffffff -Type DWord -Force
+          Set-ItemProperty $mm -Name SystemResponsiveness  -Value 0          -Type DWord -Force
+          New-Item -Path "$mm\Tasks\Games" -Force | Out-Null
+          Set-ItemProperty "$mm\Tasks\Games" -Name 'GPU Priority'        -Value 8      -Type DWord  -Force
+          Set-ItemProperty "$mm\Tasks\Games" -Name 'Priority'            -Value 6      -Type DWord  -Force
+          Set-ItemProperty "$mm\Tasks\Games" -Name 'Scheduling Category' -Value 'High' -Type String -Force
+          Set-ItemProperty "$mm\Tasks\Games" -Name 'SFIO Priority'       -Value 'High' -Type String -Force
+
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched" /v NonBestEffortLimit /t REG_DWORD /d 0 /f | Out-Null
+
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled | Out-Null
+          netsh int tcp set global timestamps=disabled | Out-Null
+          netsh int tcp set global ecncapability=disabled | Out-Null
+          netsh int tcp set global initialRto=2000 | Out-Null
+          netsh int tcp set supplemental Internet congestionprovider=ctcp | Out-Null
+
+          Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces' | ForEach-Object {
+            New-ItemProperty -Path $_.PSPath -Name TcpAckFrequency -Value 1 -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $_.PSPath -Name TCPNoDelay      -Value 1 -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $_.PSPath -Name TcpDelAckTicks  -Value 0 -PropertyType DWord -Force | Out-Null
+          }
+
+          Disable-MMAgent -MemoryCompression
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" /v DisablePagingExecutive /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" /v ClearPageFileAtShutdown /t REG_DWORD /d 0 /f | Out-Null
+          fsutil behavior set disablelastaccess 1 | Out-Null
+          fsutil behavior set disable8dot3 1 | Out-Null
+
+          function Set-VisualFx([string]$hive) {
+            reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+            reg add "$hive\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
+            reg add "$hive\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+            reg add "$hive\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+            reg add "$hive\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+          }
+          Set-VisualFx 'HKCU'
           reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
-          reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
-          reg add "HKU\DefUser\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f | Out-Null
-          reg add "HKU\DefUser\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
-          reg add "HKU\DefUser\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
-          reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+          Set-VisualFx 'HKU\DefUser'
           [gc]::Collect()
           Start-Sleep -Seconds 1
           reg unload HKU\DefUser | Out-Null
 
           $global:LASTEXITCODE = 0
 
+      - name: Enable RDP - policies, redirection, firewall, verify
+        env:
+          U_NAME: ${{ inputs.username }}
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          $ts  = 'HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $rdp = "$ts\WinStations\RDP-Tcp"
+          $pol = 'HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+
+          reg add $ts /v fDenyTSConnections    /t REG_DWORD /d 0 /f | Out-Null
+          reg add $ts /v fSingleSessionPerUser /t REG_DWORD /d 0 /f | Out-Null
+          reg add $ts /v KeepAliveInterval     /t REG_DWORD /d 1 /f | Out-Null
+          reg add "$ts\WinStations" /v DWMFRAMEINTERVAL /t REG_DWORD /d 15 /f | Out-Null
+
+          reg add $rdp /v PortNumber         /t REG_DWORD /d 3389 /f | Out-Null
+          reg add $rdp /v UserAuthentication /t REG_DWORD /d 0 /f | Out-Null
+          reg add $rdp /v SecurityLayer      /t REG_DWORD /d 0 /f | Out-Null
+          reg add $rdp /v MinEncryptionLevel /t REG_DWORD /d 1 /f | Out-Null
+          reg add $rdp /v MaxInstanceCount   /t REG_DWORD /d '0xffffffff' /f | Out-Null
+          reg add $rdp /v fPromptForPassword /t REG_DWORD /d 0 /f | Out-Null
+
+          reg add $pol /v ColorDepth                /t REG_DWORD /d 4 /f | Out-Null
+          reg add $pol /v fNoRemoteDesktopWallpaper /t REG_DWORD /d 1 /f | Out-Null
+          reg add $pol /v SelectTransport           /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v bEnumerateHWBeforeSW      /t REG_DWORD /d 1 /f | Out-Null
+          reg add $pol /v AVC444ModePreferred       /t REG_DWORD /d 1 /f | Out-Null
+          reg add $pol /v AVCHardwareEncodePreferred /t REG_DWORD /d 1 /f | Out-Null
+          reg add $pol /v MaxCompressionLevel       /t REG_DWORD /d 1 /f | Out-Null
+          reg add $pol /v fDisableFontSmoothing     /t REG_DWORD /d 0 /f | Out-Null
+
+          reg add $pol /v fDisableAudioCapture /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v fDisableCam          /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v fDisableClip         /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v fDisableCdm          /t REG_DWORD /d 0 /f | Out-Null
+
+          reg add $pol /v MaxIdleTime            /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v MaxDisconnectionTime   /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v MaxLogonTime           /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v fResetBroken           /t REG_DWORD /d 1 /f | Out-Null
+
+          reg add $pol /v UserAuthentication /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v SecurityLayer      /t REG_DWORD /d 0 /f | Out-Null
+          reg add $pol /v MinEncryptionLevel /t REG_DWORD /d 1 /f | Out-Null
+
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+          New-NetFirewallRule -DisplayName 'BERU-RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'BERU-SSH' -Direction Inbound -Protocol TCP -LocalPort 22   -Action Allow -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'BERU-WEB' -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Any | Out-Null
+
+          & sc.exe config TermService start= auto | Out-Null
+          & sc.exe start TermService | Out-Null
+          Restart-Service -Name TermService -Force
+          & sc.exe config Audiosrv start= auto | Out-Null
+          & sc.exe start Audiosrv | Out-Null
+          & sc.exe config AudioEndpointBuilder start= auto | Out-Null
+          & sc.exe start AudioEndpointBuilder | Out-Null
+
+          $ok = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) { $ok = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) { throw 'RDP listener never came up on port 3389' }
+          Write-Host 'RDP listener verified on 3389'
+          $global:LASTEXITCODE = 0
+
       - name: Connect Tailscale
+        id: ts
         env:
           TS_AUTH: ${{ inputs.ts_key }}
-          TS_HOST: beru-win-${{ github.run_number }}
         run: |
+          $ErrorActionPreference = 'SilentlyContinue'
           Write-Host "::add-mask::$env:TS_AUTH"
-          $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
-          curl.exe -sL "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -o $msi
+
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          curl.exe -sSL --retry 5 --retry-delay 2 `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -o $msi
+          if (-not (Test-Path $msi)) { throw 'Tailscale MSI download failed' }
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
 
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path $ts)) { throw 'tailscale.exe missing after install' }
 
-          & $ts up --authkey="$env:TS_AUTH" --hostname="$env:TS_HOST" --accept-routes --accept-dns=false --unattended --reset
-          if ($LASTEXITCODE -ne 0) { throw "Tailscale connection failed" }
+          & sc.exe config Tailscale start= auto | Out-Null
+          & sc.exe start Tailscale | Out-Null
+          Start-Sleep -Seconds 2
+
+          & $ts up --authkey="$env:TS_AUTH" --hostname="$env:TS_HOST_NAME" `
+            --accept-routes --accept-dns=false --unattended --reset
+          if ($LASTEXITCODE -ne 0) { throw "Tailscale up failed ($LASTEXITCODE)" }
 
           $ip = $null
-          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
+          for ($i = 0; $i -lt 60 -and -not $ip; $i++) {
             $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
             if (-not $ip) { Start-Sleep -Seconds 1 }
           }
-          if (-not $ip) { throw "No Tailscale IP assigned" }
+          if (-not $ip) { throw 'No Tailscale IP assigned' }
 
           "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ip=$ip"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Tailscale up: $env:TS_HOST_NAME / $ip"
+          $global:LASTEXITCODE = 0
 
-      - name: Print RDP Details
+      - name: Publish connection details + .rdp file
         env:
           U_NAME: ${{ inputs.username }}
           U_PASS: ${{ inputs.password }}
         run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          $comp  = $env:COMPUTERNAME
           $ram   = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
           $cpu   = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
           $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
           $disk  = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+          $next  = [int]$env:GITHUB_RUN_NUMBER + 1
+          $ip    = $env:TS_IP
+          $login = "$comp\$env:U_NAME"
+          $url   = "http://${ip}:8000/connect.rdp"
+
+          $rdpFile = @(
+            "full address:s:$ip"
+            'server port:i:3389'
+            "username:s:$env:U_NAME"
+            "domain:s:$comp"
+            'screen mode id:i:2'
+            'use multimon:i:0'
+            'smart sizing:i:1'
+            'dynamic resolution:i:1'
+            'desktopwidth:i:1920'
+            'desktopheight:i:1080'
+            'session bpp:i:32'
+            'compression:i:1'
+            'keyboardhook:i:2'
+            'audiomode:i:0'
+            'audiocapturemode:i:1'
+            'videoplaybackmode:i:1'
+            'connection type:i:7'
+            'networkautodetect:i:1'
+            'bandwidthautodetect:i:1'
+            'authentication level:i:0'
+            'enablecredsspsupport:i:0'
+            'negotiate security layer:i:0'
+            'administrative session:i:0'
+            'redirectclipboard:i:1'
+            'redirectprinters:i:0'
+            'redirectcomports:i:0'
+            'redirectsmartcards:i:0'
+            'redirectlocation:i:0'
+            'drivestoredirect:s:*'
+            'devicestoredirect:s:*'
+            'usbdevicestoredirect:s:*'
+            'camerastoredirect:s:*'
+            'autoreconnection enabled:i:1'
+            'prompt for credentials:i:0'
+            'allow font smoothing:i:1'
+            'allow desktop composition:i:1'
+          ) -join "`r`n"
+          $rdpFile | Set-Content -Path 'C:\beru\connect.rdp' -Encoding ascii
+
+          $info = @(
+            'BERU Windows RDP'
+            "node      : $env:TS_HOST_NAME"
+            "ip        : $ip"
+            "login     : $login"
+            "password  : $env:U_PASS"
+            "ssh       : ssh $login@$ip"
+            "rdp file  : http://${ip}:8000/connect.rdp"
+            "created   : $([DateTimeOffset]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')) UTC"
+            "run       : $env:GITHUB_RUN_NUMBER"
+          ) -join "`r`n"
+          $info | Set-Content -Path 'C:\beru\info.txt' -Encoding utf8
+
+          $serve = @'
+          param([int]$Port = 8000, [string]$Root = 'C:\beru')
+          $listener = New-Object System.Net.HttpListener
+          $listener.Prefixes.Add("http://+:$Port/")
+          $listener.Start()
+          $types = @{ '.rdp' = 'application/x-rdp'; '.txt' = 'text/plain'; '.log' = 'text/plain' }
+          while ($listener.IsListening) {
+            try { $ctx = $listener.GetContext() } catch { break }
+            $resp = $ctx.Response
+            $rel  = $ctx.Request.Url.AbsolutePath.TrimStart('/')
+            if ($rel -eq 'health') {
+              $b = [Text.Encoding]::UTF8.GetBytes('ok')
+              $resp.ContentType = 'text/plain'
+              $resp.OutputStream.Write($b, 0, $b.Length)
+              $resp.Close()
+              continue
+            }
+            if (-not $rel) { $rel = 'connect.rdp' }
+            if ($rel -match '\.\.') { $resp.StatusCode = 400; $resp.Close(); continue }
+            $file = Join-Path $Root ($rel -replace '/', '\')
+            if (Test-Path -LiteralPath $file -PathType Leaf) {
+              $bytes = [IO.File]::ReadAllBytes($file)
+              $ext   = [IO.Path]::GetExtension($file).ToLower()
+              if ($types.ContainsKey($ext)) { $resp.ContentType = $types[$ext] } else { $resp.ContentType = 'application/octet-stream' }
+              $resp.AddHeader('Content-Disposition', 'attachment; filename=' + [IO.Path]::GetFileName($file))
+              $resp.ContentLength64 = $bytes.Length
+              $resp.OutputStream.Write($bytes, 0, $bytes.Length)
+            } else {
+              $resp.StatusCode = 404
+            }
+            try { $resp.Close() } catch {}
+          }
+          '@
+          $serve | Set-Content -Path 'C:\beru\serve.ps1' -Encoding utf8
+          netsh http add urlacl url=http://+:8000/ user=Everyone | Out-Null
+
+          $pwshExe = 'C:\Program Files\PowerShell\7\pwsh.exe'
+          if (-not (Test-Path $pwshExe)) { $pwshExe = 'powershell.exe' }
+          Start-Process -FilePath $pwshExe `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\beru\serve.ps1' `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput 'C:\beru\web.out.log' `
+            -RedirectStandardError  'C:\beru\web.err.log'
+
+          $webOk = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            try {
+              if ((Invoke-WebRequest 'http://127.0.0.1:8000/health' -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $webOk = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $webOk) { Write-Warning 'Local file server did not answer - the artifact download still works' }
 
           $summary = @(
-            "**Windows RDP Ready (60FPS Boosted)**"
-            ""
-            "| Property | Value |"
-            "| :--- | :--- |"
-            "| **IP** | ``$env:TS_IP`` |"
+            '## Windows RDP ready'
+            ''
+            '| Property | Value |'
+            '| :--- | :--- |'
+            "| **Tailscale IP** | ``$env:TS_IP`` |"
+            "| **MagicDNS** | ``$env:TS_HOST_NAME`` |"
+            "| **Login** | ``$login`` |"
             "| **Username** | ``$env:U_NAME`` |"
             "| **Password** | ``$env:U_PASS`` |"
-            "| **CPU** | $cpu ($cores Threads) |"
+            "| **SSH** | ``ssh $login@$env:TS_IP`` (port 22) |"
+            "| **CPU** | $cpu ($cores threads) |"
             "| **RAM** | $ram GB |"
-            "| **Free Disk** | $disk GB |"
+            '| **Free disk** | ' + $disk + ' GB on C: |'
+            ''
+            '### Download the .rdp (always this run)'
+            "http://${ip}:8000/connect.rdp"
+            ''
+            'Saves as `connect.rdp`. Double-click it, or: `remmina -c ~/Downloads/connect.rdp`'
+            ''
+            "Handoff: next node will be ``beru-win-$next``. Stop early with ``C:\stop.txt``, hand off now with ``C:\restart.txt``."
+            ''
+            '### connect.rdp'
+            '```'
           ) -join "`n"
+
+          $summary += "`n$rdpFile"
+          $summary += '```'
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-          Write-Host "=========================================="
-          Write-Host "  IP        : $env:TS_IP"
-          Write-Host "  Username  : $env:U_NAME"
+          Write-Host '=========================================='
+          Write-Host "  .rdp      : $url"
+          Write-Host "  IP        : $ip"
+          Write-Host "  Host      : $env:TS_HOST_NAME"
+          Write-Host "  Login     : $login"
           Write-Host "  Password  : $env:U_PASS"
           Write-Host "  RAM       : $ram GB"
           Write-Host "  CPU       : $cpu ($cores threads)"
           Write-Host "  Free disk : $disk GB (C:)"
-          Write-Host "=========================================="
+          Write-Host '=========================================='
 
-      - name: Keep Alive and Auto-Restart
+      - name: Upload connect.rdp artifact
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beru-rdp-${{ github.run_number }}-${{ steps.ts.outputs.ip }}
+          path: |
+            C:/beru/connect.rdp
+            C:/beru/info.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+          overwrite: true
+
+      - name: Link artifact in summary
+        run: |
+          @(
+            ''
+            '### Artifact download'
+            "[beru-rdp-${{ github.run_number }}-${{ steps.ts.outputs.ip }}](${{ steps.artifact.outputs['artifact-url'] }})"
+            ''
+          ) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Watchdog and auto-restart
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -197,40 +530,166 @@ jobs:
           IN_PASS: ${{ inputs.password }}
           IN_TOOLS: ${{ inputs.install_tools }}
           WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_FILE: .github/workflows/Beru-Windows-RDP.yml
           REF_NAME: ${{ github.ref_name }}
         run: |
-          $start     = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
-          $restartAt = $start.AddMinutes(335)
-          $endAt     = $start.AddMinutes(355)
-          $restarted = $false
+          $ErrorActionPreference = 'SilentlyContinue'
+          $ts  = 'C:\Program Files\Tailscale\tailscale.exe'
+          $log = 'C:\beru\watchdog.log'
+
+          function Log([string]$m) {
+            $line = '[{0:HH:mm:ss}] {1}' -f [DateTimeOffset]::UtcNow.ToLocalTime(), $m
+            Write-Host $line
+            Add-Content -Path $log -Value $line
+          }
+
+          function Test-Rdp {
+            [bool](Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)
+          }
+
+          function Heal-Rdp {
+            Log 'RDP listener missing -> restarting TermService'
+            & sc.exe stop TermService | Out-Null
+            Start-Sleep -Seconds 3
+            & sc.exe start TermService | Out-Null
+            for ($i = 0; $i -lt 20; $i++) {
+              if (Test-Rdp) { Log 'RDP listener recovered'; return }
+              Start-Sleep -Seconds 1
+            }
+            Log 'RDP heal FAILED'
+          }
+
+          function Heal-Tailscale {
+            if ((Get-Service -Name Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running') {
+              Log 'Tailscale service down -> start'
+              & sc.exe start Tailscale | Out-Null
+              Start-Sleep -Seconds 3
+            }
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) {
+              Log 'Tailscale offline -> re-auth'
+              & $ts up --authkey="$env:IN_TS_KEY" --hostname="$env:TS_HOST_NAME" `
+                --accept-routes --accept-dns=false --unattended --reset | Out-Null
+              for ($i = 0; $i -lt 20; $i++) {
+                $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+                if ($ip) { break }
+                Start-Sleep -Seconds 2
+              }
+              if ($ip) { Log "Tailscale back: $ip" } else { Log 'Tailscale re-auth FAILED' }
+            }
+          }
+
+          function Heal-Web {
+            $ok = $false
+            try {
+              $r = Invoke-WebRequest 'http://127.0.0.1:8000/health' -UseBasicParsing -TimeoutSec 5
+              $ok = ($r.StatusCode -eq 200)
+            } catch { }
+            if (-not $ok) {
+              Log 'Web file server down -> restart'
+              Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue |
+                ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+              Start-Sleep -Seconds 1
+              $pwshExe = 'C:\Program Files\PowerShell\7\pwsh.exe'
+              if (-not (Test-Path $pwshExe)) { $pwshExe = 'powershell.exe' }
+              Start-Process -FilePath $pwshExe `
+                -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\beru\serve.ps1' `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput 'C:\beru\web.out.log' `
+                -RedirectStandardError  'C:\beru\web.err.log'
+              Start-Sleep -Seconds 3
+            }
+          }
+
+          function Clear-Cruft {            foreach ($p in 'C:\Windows\Temp','C:\Windows\SoftwareDistribution\Download',
+                           'C:\Users\Public\Documents',"$env:TEMP") {
+              Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt (Get-Date).AddHours(-2) } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          function Invoke-Handoff {
+            Log 'Dispatching next run'
+            $runs = gh run list --workflow "$env:WORKFLOW_NAME" --limit 20 --json databaseId,createdAt,status 2>$null | ConvertFrom-Json
+            $live = @($runs | Where-Object {
+              $_.databaseId -ne [long]$env:GITHUB_RUN_ID -and
+              $_.status -in @('queued','in_progress','requested','waiting','pending')
+            })
+            if ($live.Count -gt 0) {
+              Log "Another run already active ($($live[0].databaseId)) -> skip"
+              return $true
+            }
+            $ghArgs = @('workflow','run',"$env:WORKFLOW_NAME",'--ref',"$env:REF_NAME",
+                        '-f',"ts_key=$env:IN_TS_KEY",
+                        '-f',"username=$env:IN_USER",
+                        '-f',"password=$env:IN_PASS",
+                        '-f',"auto_restart=$env:AUTO_RESTART",
+                        '-f',"install_tools=$env:IN_TOOLS")
+            & gh @ghArgs
+            if ($LASTEXITCODE -ne 0 -and $env:WORKFLOW_FILE) {
+              Log 'Dispatch by name failed -> retry by file path'
+              $ghArgs[2] = $env:WORKFLOW_FILE
+              & gh @ghArgs
+            }
+            if ($LASTEXITCODE -eq 0) { Log 'Handoff dispatched'; return $true }
+            Log 'Handoff dispatch FAILED'
+            return $false
+          }
+
+          if (-not $env:JOB_START) {
+            $env:JOB_START = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          }
+          $start      = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
+          $restartAt  = $start.AddMinutes(330)
+          $endAt      = $start.AddMinutes(350)
+          $dispatched = $false
+          $nextTry    = [DateTimeOffset]::MinValue
+          $lastCruft  = [DateTimeOffset]::MinValue
+
+          Log "Watchdog up. handoff=$restartAt  end=$endAt"
+          Clear-Cruft
+          $lastCruft = [DateTimeOffset]::UtcNow
 
           while ([DateTimeOffset]::UtcNow -lt $endAt) {
-            if (Test-Path "C:\stop.txt") { break }
+            $now = [DateTimeOffset]::UtcNow
 
-            $procs = 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker'
-            foreach ($p in $procs) {
+            if (Test-Path 'C:\stop.txt') { Log 'C:\stop.txt -> stop'; break }
+
+            if (Test-Path 'C:\restart.txt') {
+              Log 'C:\restart.txt -> immediate handoff'
+              Remove-Item 'C:\restart.txt' -Force
+              $restartAt = $now
+            }
+
+            foreach ($p in 'ngen','ngentask','mscorsvw','CompatTelRunner','TiWorker',
+                           'TrustedInstaller','MpCmdRun','MpDefenderCoreService') {
               Stop-Process -Name $p -Force -ErrorAction SilentlyContinue
             }
 
-            if ($env:AUTO_RESTART -eq 'true' -and -not $restarted -and [DateTimeOffset]::UtcNow -ge $restartAt) {
-              gh workflow run "$env:WORKFLOW_NAME" --ref "$env:REF_NAME" `
-                -f ts_key="$env:IN_TS_KEY" `
-                -f username="$env:IN_USER" `
-                -f password="$env:IN_PASS" `
-                -f auto_restart="$env:AUTO_RESTART" `
-                -f install_tools="$env:IN_TOOLS"
-              $restarted = $true
+            Heal-Tailscale
+            Heal-Web
+            if (-not (Test-Rdp)) { Heal-Rdp }
+
+            if ($now -gt $lastCruft.AddMinutes(45)) { Clear-Cruft; $lastCruft = $now }
+
+            if ($env:AUTO_RESTART -eq 'true' -and -not $dispatched -and $now -ge $restartAt -and $now -ge $nextTry) {
+              if (Invoke-Handoff) { $dispatched = $true } else { $nextTry = $now.AddMinutes(3) }
             }
 
-            $left = [int]($endAt - [DateTimeOffset]::UtcNow).TotalMinutes
-            Write-Host "Remaining: $left min | IP: $env:TS_IP"
-            Start-Sleep -Seconds 60
+            $left = [int]($endAt - $now).TotalMinutes
+            $free = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+            Log "left=${left}m  free=${free}GB  rdp=$(if (Test-Rdp) {'up'} else {'DOWN'})  handoff=$(if ($dispatched) {'sent'} else {'pending'})"
+
+            Start-Sleep -Seconds 30
           }
+          Log 'Watchdog exit'
+          $global:LASTEXITCODE = 0
 
       - name: Cleanup Tailscale
         if: always()
         run: |
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
           if (Test-Path $ts) {
             & $ts logout 2>$null
           }
