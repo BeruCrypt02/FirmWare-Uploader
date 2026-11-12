@@ -4,17 +4,14 @@ name: Beru-Windows-RDP
 on:
   workflow_dispatch:
     inputs:
-      ts_key:
-        description: 'Tailscale Auth Key (use a reusable / ephemeral key)'
-        required: true
       username:
         description: 'Windows Username'
         required: true
         default: 'BeruCrypt002'
       password:
-        description: 'Windows Password'
-        required: true
-        default: 'Beru12112k'
+        description: 'Windows Password (empty = auto-generated, shown in summary)'
+        required: false
+        default: ''
       auto_restart:
         description: 'Start a new runner before the 6h limit'
         required: true
@@ -52,7 +49,7 @@ jobs:
       - name: Preflight - account, security policy, Defender
         env:
           U_NAME: ${{ inputs.username }}
-          U_PASS: ${{ inputs.password }}
+          U_PASS_IN: ${{ inputs.password }}
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
           $ProgressPreference    = 'SilentlyContinue'
@@ -74,7 +71,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Warning "secedit returned $LASTEXITCODE" }
           Remove-Item C:\secpol.cfg -Force
 
-          $sec = ConvertTo-SecureString $env:U_PASS -AsPlainText -Force
+          $pass = $env:U_PASS_IN
+          if (-not $pass) {
+            $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789@#%*=+-_'
+            $pass  = -join (1..24 | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+          }
+          "U_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:U_PASS = $pass
+
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
           if (Get-LocalUser -Name $env:U_NAME) {
             Set-LocalUser -Name $env:U_NAME -Password $sec -PasswordNeverExpires $true -AccountNeverExpires -UserMayChangePassword $false
           } else {
@@ -300,9 +305,10 @@ jobs:
       - name: Connect Tailscale
         id: ts
         env:
-          TS_AUTH: ${{ inputs.ts_key }}
+          TS_AUTH: ${{ secrets.TS_AUTHKEY }}
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
+          if (-not $env:TS_AUTH) { throw 'Missing repo secret TS_AUTHKEY (Tailscale auth key)' }
           Write-Host "::add-mask::$env:TS_AUTH"
 
           $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
@@ -337,7 +343,6 @@ jobs:
       - name: Publish connection details + .rdp file
         env:
           U_NAME: ${{ inputs.username }}
-          U_PASS: ${{ inputs.password }}
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
 
@@ -525,12 +530,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           AUTO_RESTART: ${{ inputs.auto_restart }}
-          IN_TS_KEY: ${{ inputs.ts_key }}
+          IN_TS_KEY: ${{ secrets.TS_AUTHKEY }}
           IN_USER: ${{ inputs.username }}
-          IN_PASS: ${{ inputs.password }}
           IN_TOOLS: ${{ inputs.install_tools }}
           WORKFLOW_NAME: ${{ github.workflow }}
-          WORKFLOW_FILE: .github/workflows/Beru-Windows-RDP.yml
+          WORKFLOW_FILE: .github/workflows/rdp.yml
           REF_NAME: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -621,9 +625,8 @@ jobs:
               return $true
             }
             $ghArgs = @('workflow','run',"$env:WORKFLOW_NAME",'--ref',"$env:REF_NAME",
-                        '-f',"ts_key=$env:IN_TS_KEY",
                         '-f',"username=$env:IN_USER",
-                        '-f',"password=$env:IN_PASS",
+                        '-f',"password=$env:U_PASS",
                         '-f',"auto_restart=$env:AUTO_RESTART",
                         '-f',"install_tools=$env:IN_TOOLS")
             & gh @ghArgs
