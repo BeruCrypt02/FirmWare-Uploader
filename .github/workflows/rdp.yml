@@ -402,7 +402,7 @@ jobs:
             "ip        : $ip"
             "login     : $login"
             "password  : $env:U_PASS"
-            "ssh       : ssh $login@$ip"
+            "ssh       : ssh $env:U_NAME@$ip (use the plain username, not the domain)"
             "rdp file  : http://${ip}:8000/connect.rdp"
             "created   : $([DateTimeOffset]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')) UTC"
             "run       : $env:GITHUB_RUN_NUMBER"
